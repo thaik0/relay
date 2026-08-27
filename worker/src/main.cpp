@@ -258,12 +258,14 @@ int main() {
             std::cout << "claimed job " << job->id << std::endl;
             try {
                 execute_job(*job);
-                mark_terminal(connection.get(), *job, "succeeded");
-                std::cout << "job " << job->id << " succeeded" << std::endl;
             } catch (const std::exception& error) {
                 std::cerr << "job " << job->id << " failed: " << error.what() << std::endl;
                 mark_terminal(connection.get(), *job, "failed");
+                continue;
             }
+
+            mark_terminal(connection.get(), *job, "succeeded");
+            std::cout << "job " << job->id << " succeeded" << std::endl;
         } catch (const std::exception& error) {
             std::cerr << "worker database error: " << error.what() << std::endl;
             connection.reset();
