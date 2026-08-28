@@ -8,6 +8,7 @@ import csv
 import math
 import statistics
 from collections import defaultdict
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -69,6 +70,10 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def format_table(rows: Iterable[dict[str, Any]]) -> str:
+    def formatted(value: Any, places: int) -> str:
+        quantum = Decimal(1).scaleb(-places)
+        return str(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
+
     lines = [
         "Workers | Throughput | p50 Job | p95 Job | p50 Claim | p95 Claim",
         "------- | ---------- | ------- | ------- | --------- | ---------",
@@ -76,11 +81,11 @@ def format_table(rows: Iterable[dict[str, Any]]) -> str:
     for row in rows:
         lines.append(
             f"{int(row['worker_count']):7d} | "
-            f"{float(row['throughput_jobs_per_second']):10.2f} | "
-            f"{float(row['p50_job_latency_ms']):7.2f} | "
-            f"{float(row['p95_job_latency_ms']):7.2f} | "
-            f"{float(row['p50_claim_latency_ms']):9.3f} | "
-            f"{float(row['p95_claim_latency_ms']):9.3f}"
+            f"{formatted(row['throughput_jobs_per_second'], 2):>10} | "
+            f"{formatted(row['p50_job_latency_ms'], 2):>7} | "
+            f"{formatted(row['p95_job_latency_ms'], 2):>7} | "
+            f"{formatted(row['p50_claim_latency_ms'], 3):>9} | "
+            f"{formatted(row['p95_claim_latency_ms'], 3):>9}"
         )
     return "\n".join(lines)
 

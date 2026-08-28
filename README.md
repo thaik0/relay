@@ -1,9 +1,13 @@
 # Relay
 
-Relay is a small distributed job queue built in milestones. Milestone 5 adds
-submission idempotency and a concrete demonstration of duplicate execution and
-idempotent side effects to the FastAPI control plane, PostgreSQL queue, and
-concurrent C++20 workers.
+Relay is a small distributed job-processing system built to make concurrency,
+failure recovery, at-least-once execution, and performance measurable. A
+FastAPI control plane persists work in PostgreSQL; independent C++20 workers
+claim it with row locks, execute outside the transaction, and use leases to
+recover jobs abandoned by dead workers.
+
+The project is intentionally narrow. It is an engineering study of durable
+queue coordination and failure semantics, not a feature-complete task system.
 
 ## Architecture
 
@@ -13,20 +17,20 @@ concurrent C++20 workers.
                      v
                 PostgreSQL
                      |
-          -----------------------
-          |          |          |
-          v          v          v
-       Worker 1   Worker 2   Worker 3
+          -------------------------
+          |           |           |
+          v           v           v
+       Worker 1    Worker 2    Worker N
+        C++20       C++20       C++20
 ```
 
-- FastAPI accepts jobs with `POST /jobs` and returns their persisted state with
-  `GET /jobs/{job_id}`.
-- PostgreSQL stores jobs, retry schedules, and lease deadlines and coordinates
-  independent workers with row-level locking.
-- Workers atomically claim eligible queued or expired running jobs, commit,
-  execute outside the transaction, and record success or a retry decision.
+- `POST /jobs` creates a durable job; `GET /jobs/{job_id}` returns its state.
+- PostgreSQL owns job state, retry schedules, lease deadlines, and uniqueness
+  constraints.
+- Workers atomically claim eligible rows, commit, run handlers, and then record
+  success or a retry decision.
 
-The worker supports these payloads:
+Supported demonstration payloads are:
 
 ```json
 {"type": "sleep", "duration_ms": 500}
@@ -34,36 +38,107 @@ The worker supports these payloads:
 {"type": "write_effect", "operation_id": "operation-123", "value": "hello"}
 ```
 
-`duration_ms` must be an integer from 0 through 60000. The `fail` job always
-fails and exists to demonstrate deterministic retries. Missing or invalid
-fields and unsupported job types are also execution failures: they retry until
-the configured attempt limit and do not stop the worker.
+`sleep` accepts an integer duration from 0 through 60000 ms. `fail` exercises
+retries deterministically. `write_effect` demonstrates duplicate execution
+with a logically idempotent side effect.
 
-`write_effect` is the small Milestone 5 side-effect example. Every execution is
-recorded in `effect_attempts`, while the logical result is stored in `effects`.
-It is intentionally specific rather than a generic output or workflow system.
+## Job lifecycle
 
-## Submission idempotency
+```text
+                         handler succeeds
+queued  --->  running  -------------------->  succeeded
+  ^             |
+  |             | handler fails and attempts remain
+  |             v
+  +----- queued until available_at (exponential backoff)
+                |
+                | handler fails at attempt limit, or an exhausted lease expires
+                v
+              failed
 
-`POST /jobs` accepts an optional `idempotency_key`:
-
-```bash
-curl -i -X POST http://localhost:8000/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"payload":{"type":"sleep","duration_ms":100},"idempotency_key":"request-abc"}'
+running with an expired lease ---> running again with attempts + 1
 ```
 
-The first request creates a job and returns `201 Created`. Repeating the same
-key and JSON payload returns the original job and `200 OK`. Reusing the key
-with a different payload returns `409 Conflict`.
+`attempts` is the number of executions that have started. A new job begins at
+zero; every claim or reclaim increments it once inside the claim transaction.
+Terminal jobs are never eligible again.
 
-PostgreSQL enforces a partial unique index on non-null idempotency keys. The API
-uses `INSERT ... ON CONFLICT DO NOTHING`, then reads the winning row in the
-same transaction. Concurrent callers therefore converge on one job ID without
-an application mutex or a race-prone `SELECT`-then-`INSERT`. Requests without
-an idempotency key retain the original behavior and always create a new job.
+## Atomic claiming
 
-## Run multiple workers
+Each worker runs one short PostgreSQL transaction:
+
+```text
+BEGIN
+finalize one expired running job already at the attempt limit, if present
+select the oldest eligible queued or expired running job
+  FOR UPDATE SKIP LOCKED
+set status = running, increment attempts, and assign a lease
+COMMIT
+```
+
+`FOR UPDATE` protects the selected row until commit. `SKIP LOCKED` lets another
+worker select different work instead of waiting on that row. Selection and the
+state transition occur in the same transaction, so workers cannot own the same
+attempt simultaneously. The same rule protects expired-job reclaims.
+
+Execution happens after commit. Arbitrary job runtime therefore does not hold a
+row lock or an open database transaction. Success and failure updates match
+both job ID and attempt number; a stale worker cannot overwrite a newer attempt
+after its lease has expired.
+
+## Leases, recovery, and retries
+
+A claim sets `lease_expires_at` using PostgreSQL time. If a worker disappears,
+it cannot run cleanup, so the row remains `running`. Once its fixed lease
+expires, any worker may reclaim it safely. An unexpired lease is never eligible.
+
+Ordinary handler failures either return the job to `queued` with:
+
+```text
+RETRY_BASE_SECONDS * 2^(attempt - 1)
+```
+
+or mark it permanently `failed` at `MAX_JOB_ATTEMPTS`. Retry eligibility also
+uses PostgreSQL time. Workers continue polling the whole queue rather than
+sleeping for a particular retry.
+
+| Setting | Compose default | Meaning |
+| --- | ---: | --- |
+| `JOB_LEASE_SECONDS` | `10` | Fixed lease assigned at claim time |
+| `MAX_JOB_ATTEMPTS` | `3` | Maximum executions that may begin |
+| `RETRY_BASE_SECONDS` | `1` | Exponential-backoff base delay |
+
+## At-least-once execution and idempotency
+
+The queue cannot atomically combine an arbitrary external side effect with its
+own PostgreSQL acknowledgement:
+
+```text
+perform side effect
+        |
+worker crashes before recording success
+        |
+lease expires and another worker executes the job again
+```
+
+Relay therefore provides at-least-once execution, not exactly-once execution.
+Two separate idempotency mechanisms address different duplicate sources:
+
+- **Submission idempotency:** an optional `idempotency_key` on `POST /jobs`
+  prevents client retries from creating multiple jobs. A partial PostgreSQL
+  unique index and `INSERT ... ON CONFLICT DO NOTHING` make concurrent matching
+  requests converge on one job. Reusing a key with a different payload returns
+  `409 Conflict`.
+- **Execution-side idempotency:** `write_effect` inserts a logical result into
+  `effects`, keyed by `operation_id`, with `ON CONFLICT DO NOTHING`. The
+  non-idempotent `effect_attempts` audit still records every execution, so a
+  post-effect crash visibly produces two executions but one logical effect.
+
+Atomic claim, at-least-once recovery, and idempotent effects are distinct
+guarantees. Production consumers need an idempotency facility owned by the
+side-effecting system, such as a payment API key or deterministic resource ID.
+
+## Run Relay
 
 Requirements: Docker with Docker Compose.
 
@@ -71,292 +146,230 @@ Requirements: Docker with Docker Compose.
 docker compose up --build --scale worker=4
 ```
 
-This starts PostgreSQL, the API at <http://localhost:8000>, and four independent
-worker containers connected to the same queue. The API documentation is at
-<http://localhost:8000/docs>. The API health check is `GET /health`.
-PostgreSQL data is held in the named `postgres_data` volume.
-
-Submit and inspect a sleep job:
+The API is available at <http://localhost:8000>, its OpenAPI UI at
+<http://localhost:8000/docs>, and health at `GET /health`. Submit a job with:
 
 ```bash
 curl -X POST http://localhost:8000/jobs \
   -H 'Content-Type: application/json' \
-  -d '{"payload":{"type":"sleep","duration_ms":500}}'
-
-curl http://localhost:8000/jobs/<JOB_ID>
+  -d '{"payload":{"type":"sleep","duration_ms":500},"idempotency_key":"request-abc"}'
 ```
 
-Every worker uses `WORKER_ID` when configured, otherwise its unique Compose
-hostname. Follow all replicas with:
+Compose assigns independent hostnames to scaled workers. Follow their
+machine-parseable event logs with `docker compose logs -f worker`.
+
+## Benchmark methodology
+
+The main benchmark used one synchronized batch per trial:
+
+- worker counts: 1, 4, and 8;
+- three trials per worker count;
+- 600 `sleep` jobs per trial, each 25 ms;
+- 30 warm-up jobs after every scale change;
+- 10 s leases, three maximum attempts, 1 s retry base, and 250 ms empty-queue
+  polling;
+- benchmark-owned idempotency keys, with only those rows removed between runs.
+
+The harness stages rows directly in PostgreSQL with the same future
+`created_at` and `available_at`. This deliberate synchronized release excludes
+sequential HTTP submission and container startup from the worker-scaling
+measurement. It means job latency is **batch completion latency**: later jobs
+wait behind earlier jobs, so the percentiles are not single-job service time.
+The FastAPI submission path is covered separately by integration tests.
+
+Metrics are defined as:
+
+- throughput = 600 successful jobs / (release time to final `completed_at`);
+- job completion latency = `completed_at - created_at`;
+- claim transaction latency = worker monotonic time immediately before `BEGIN`
+  through successful `COMMIT` for a claimed job.
+
+Claim latency includes libpq, container/network, PostgreSQL, and commit
+overhead; it is not pure server execution time. Instrumentation adds a timer and
+one numeric field to the existing successful-claim log line. It performs no
+extra query, transaction, metrics write, or additional log flush.
+
+The recorded run was on 2026-08-28 using an ARM64 Mac with 12 logical CPUs,
+Docker 29.6.1, Docker Compose 5.1.4, and the Compose `postgres:17-alpine`
+database. Local/container benchmark results are environment-dependent.
+
+Reproduce the full run from the repository root:
 
 ```bash
-docker compose logs -f worker
+python3 benchmarks/run_benchmark.py
 ```
 
-## Leases and crash recovery
-
-`attempts` has one meaning: **the number of execution attempts that have
-started**. A new job has `attempts = 0`. Every successful claim or reclaim
-increments it exactly once inside the claim transaction.
-
-Each worker performs this short transaction:
-
-```text
-BEGIN
-finalize one expired running job already at the attempt limit, if present
-select the oldest eligible queued or expired running job
-  with attempts below the limit
-  FOR UPDATE SKIP LOCKED
-set status = running
-increment attempts
-set lease_expires_at = database time + lease duration
-COMMIT
-```
-
-Both new claims and reclaims therefore retain Milestone 3's PostgreSQL
-concurrency safety. `FOR UPDATE` locks the selected row until commit, while
-`SKIP LOCKED` lets competing workers choose other work without waiting. Several
-workers can discover an expired lease, but only one can lock and begin its next
-attempt. Unexpired running jobs, future retries, succeeded jobs, and permanently
-failed jobs are not eligible.
-
-Execution still happens after commit. Long work does not hold a database
-transaction, block queue progress, or retain a row lock. If a worker dies after
-commit, the `running` row and lease deadline remain in PostgreSQL. Once database
-time reaches `lease_expires_at`, any surviving worker can safely reclaim it.
-Recovery never depends on shutdown cleanup from the dead process.
-
-Successful completion sets `status = succeeded`, records `completed_at`, and
-clears the lease. Completion and failure updates also match the attempt number
-the worker claimed. If a stale worker finishes after another worker has already
-reclaimed the row, its outdated update cannot overwrite the newer attempt.
-
-Worker policy is configured with environment variables. Compose supplies these
-defaults:
-
-| Variable | Default | Meaning |
-| --- | ---: | --- |
-| `JOB_LEASE_SECONDS` | `10` | Fixed lease duration assigned at claim time |
-| `MAX_JOB_ATTEMPTS` | `3` | Maximum number of executions that may begin |
-| `RETRY_BASE_SECONDS` | `1` | Base delay for execution-failure retries |
-
-Positive fractional second values are accepted for lease and retry timing,
-which keeps focused integration tests fast.
-
-## Retries and exponential backoff
-
-After an ordinary execution failure, the worker makes one database update:
-
-```text
-if attempts < MAX_JOB_ATTEMPTS:
-    status = queued
-    available_at = database time + backoff
-    completed_at = null
-    lease_expires_at = null
-else:
-    status = failed
-    completed_at = database time
-    lease_expires_at = null
-```
-
-The deterministic delay after attempt `n` is:
-
-```text
-RETRY_BASE_SECONDS * 2^(n - 1)
-```
-
-With the defaults, failures after attempts 1 and 2 wait 1 and 2 seconds. A
-failure on attempt 3 is permanent. Retry eligibility uses
-`available_at <= CURRENT_TIMESTAMP` in PostgreSQL. Workers schedule the retry
-and immediately return to polling the whole queue; no worker sleeps waiting for
-one particular job.
-
-To observe the complete retry sequence, submit a deterministic failure and
-watch its state and logs:
+Useful explicit options are:
 
 ```bash
-curl -X POST http://localhost:8000/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"payload":{"type":"fail"}}'
-
-watch -n 0.25 curl -s http://localhost:8000/jobs/<JOB_ID>
-docker compose logs -f worker
+python3 benchmarks/run_benchmark.py \
+  --worker-counts 1 4 8 --trials 3 --jobs 600 \
+  --duration-ms 25 --warmup-jobs 30
 ```
 
-The logs expose `claimed`, `reclaimed`, `retry_scheduled`, `succeeded`, and
-`failed_permanently` events with the worker, job, attempt, and relevant lease or
-retry timestamp.
+The script builds/scales Compose services, refuses to run alongside unrelated
+active jobs, prints a concise table, and writes raw and summarized CSV files in
+[`benchmarks/results`](benchmarks/results). `summarize.py` can regenerate the
+summary from `raw_trials.csv`.
 
-## Forced worker-crash demonstration
+## Benchmark results
 
-Run the deterministic demo from the repository root:
+Each value below is the median of the three trial-level measurements. Throughput
+is jobs/s; all latency columns are milliseconds.
+
+| Workers | Throughput | p50 Job | p95 Job | p50 Claim | p95 Claim |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 32.41 | 9284.10 | 17600.65 | 1.772 | 3.662 |
+| 4 | 131.70 | 2367.86 | 4350.92 | 1.738 | 4.143 |
+| 8 | 250.42 | 1289.58 | 2270.59 | 1.838 | 3.879 |
+
+Raw trial rows are in
+[`raw_trials.csv`](benchmarks/results/raw_trials.csv), with all 5,400 per-job
+and per-claim samples in `job_metrics.csv` and `claim_metrics.csv`.
+
+### Findings
+
+- Throughput scaled 4.06× from one to four workers and 7.73× from one to eight.
+  Four to eight workers added 1.90× throughput, a small decline from ideal 2×
+  scaling but still a strong gain. Eight workers had not reached a clear
+  saturation point on this machine.
+- Parallelism reduced synchronized-batch p95 completion latency from 17.60 s to
+  4.35 s to 2.27 s. This is the expected reduction in time spent waiting behind
+  the released batch.
+- Claim p50 remained around 1.7–1.8 ms. Claim p95 moved from 3.66 ms to 4.14 ms
+  and then 3.88 ms rather than increasing monotonically. PostgreSQL claim
+  contention was therefore not measurably worsening through eight workers in
+  this run.
+- The modest four-to-eight scaling loss is not enough to identify a database
+  bottleneck; normal scheduling, logging, client, and container variation are
+  also present. The data bounds the result: the centralized claim path was not
+  the limiting factor at the tested concurrency.
+
+## Queue-overload observation
+
+`run_overload.py` scheduled 300 jobs at 60 arrivals/s against one worker, whose
+measured batch capacity was about 32.4 jobs/s. Queue depth counts only arrived
+jobs still in `queued`, not future scheduled rows.
+
+```bash
+python3 benchmarks/run_overload.py --no-build
+```
+
+While arrivals exceeded completion capacity, queued depth grew to 139 jobs near
+the end of the five-second arrival window. Once arrivals stopped, the worker
+drained the backlog; all 300 jobs were complete and queue depth was zero at
+9.59 s. Samples are in
+[`overload.csv`](benchmarks/results/overload.csv).
+
+## Failure demonstrations
+
+Measure force-kill recovery with a 5 s lease:
 
 ```bash
 python3 scripts/crash_recovery_demo.py
 ```
 
-The helper starts PostgreSQL, the API, and two workers with a 5-second lease;
-submits a 2.5-second sleep job; identifies the container that logged its claim;
-and sends that container `SIGKILL` with `docker kill --signal KILL`. It verifies
-all of these externally visible states:
+The script starts two workers, finds the container that claimed a 2.5 s sleep
+job, sends it `SIGKILL`, verifies the row remains temporarily stranded, and
+observes a survivor reclaim attempt 2. The recorded completed-kill-to-observed-
+reclaim interval was **4.977 s**, close to the 5 s lease; the small difference
+reflects how soon after claim the kill completed and 50 ms observation polling.
+Recovery is primarily bounded by the remaining lease plus claim/poll delay. The
+machine-readable result is
+[`recovery.json`](benchmarks/results/recovery.json).
 
-```text
-running, attempts = 1
-worker is force-killed
-still running, attempts = 1 before lease expiry
-running, attempts = 2 after another worker reclaims it
-succeeded, attempts = 2, lease_expires_at = null
-```
-
-The demo prints the relevant worker logs and exits nonzero if recovery does not
-occur. It exercises actual worker death, not graceful shutdown or an ordinary
-job exception.
-
-## Duplicate execution and an idempotent effect
-
-Submission idempotency and execution idempotency solve different problems. An
-idempotency key prevents clients from creating the same logical job twice. It
-cannot prevent an already-created job from executing twice after a worker loses
-its lease or dies before acknowledging success.
-
-Run the deterministic post-effect crash demo:
+Demonstrate the side-effect/acknowledgement failure window with:
 
 ```bash
 python3 scripts/idempotent_effect_demo.py
 ```
 
-The script starts two workers with a short lease and submits:
+Attempt 1 commits the effect and intentionally exits before acknowledging the
+job. Attempt 2 runs after lease expiry. The demo requires two execution-audit
+rows, one logical effect row, and final `succeeded` state.
 
-```json
-{
-  "payload": {
-    "type": "write_effect",
-    "operation_id": "operation-123",
-    "value": "hello",
-    "crash_after_effect_on_attempt": 1
-  }
-}
-```
+## Design decisions and tradeoffs
 
-The first worker commits the effect and its execution audit, logs
-`effect_applied`, and intentionally terminates the process before updating the
-job. The row remains `running` until its lease expires. A second worker then
-reclaims attempt 2, executes the handler again, logs
-`effect_already_applied`, and marks the job succeeded.
+**Why PostgreSQL?** It provides durable state, transactions, row-level locks,
+`SKIP LOCKED`, database time, and uniqueness constraints. That is enough to
+study queue coordination without introducing another distributed service.
 
-The non-idempotent `effect_attempts` audit contains two rows, making duplicate
-execution observable. The real `effects` table uses `operation_id` as its
-primary key, and the handler uses `ON CONFLICT (operation_id) DO NOTHING`, so
-only one logical effect exists. Reusing an operation ID with a different value
-is treated as an execution error rather than silently accepted.
+**Why execute outside the claim transaction?** Holding a transaction and row
+lock while arbitrary code runs would create long transactions and unnecessary
+contention. The lease and attempt-matched completion update handle lost or
+stale owners instead.
 
-This PostgreSQL example is deliberately reproducible, not a distributed
-transaction pattern. Real consumers need an idempotency mechanism owned by the
-side-effecting system, such as a payment API idempotency key, an email message
-ID, a unique database operation ID, or a deterministic object/resource ID.
+**Why leases?** A crashed or force-killed worker cannot reliably deregister or
+run cleanup. A persisted deadline makes abandoned work recoverable without its
+cooperation.
 
-### Three separate guarantees
+**Why at-least-once rather than exactly-once?** An external side effect and the
+queue acknowledgement cannot generally share one atomic transaction. A crash
+between them makes re-execution necessary for recovery.
 
-- **Atomic claim:** `FOR UPDATE SKIP LOCKED` prevents two workers from owning
-  the same execution attempt simultaneously.
-- **At-least-once recovery:** an expired lease allows the job to execute again
-  when ownership is lost.
-- **Idempotent side effect:** a unique operation ID allows repeated executions
-  without creating repeated logical effects.
+**Why idempotency?** Submission keys collapse repeated client requests, while
+side-effect keys make unavoidable repeated executions logically safe. Neither
+mechanism substitutes for the other.
 
-Relay does not guarantee exactly-once execution. It provides at-least-once
-execution, and consumers that require duplicate-safe behavior must make their
-side effects idempotent.
+**Where does scaling bottleneck?** This experiment found no monotonic claim-
+latency increase through eight workers, so it does not support naming
+PostgreSQL contention as the current limit. Eventually the single PostgreSQL
+coordinator, one claim transaction per job, per-job execution logging, or host
+resources must cap scaling; locating that point would require higher worker
+counts and separate profiling, outside this milestone.
 
-## Batch demonstration
+## Tests
 
-With four workers running, submit 100 short jobs:
-
-```bash
-python3 scripts/submit_jobs.py --count 100 --duration-ms 100
-```
-
-The helper periodically prints state totals and exits after all jobs succeed.
-This validates concurrent operation; it is not the formal throughput and
-latency benchmark planned for Milestone 6.
-
-## Run the tests
-
-All tests use real PostgreSQL. Run the API and direct PostgreSQL locking tests
-with polling workers stopped:
+All tests use real PostgreSQL. Run API, locking, and benchmark-calculation tests
+with workers stopped:
 
 ```bash
 docker compose up -d --build db api
 docker compose stop worker
-docker compose exec api pytest -q tests/test_jobs.py tests/test_claiming.py
+docker compose exec api pytest -q \
+  tests/test_jobs.py tests/test_claiming.py tests/test_benchmarks.py
 ```
 
-`tests/test_jobs.py` includes sequential and eight-caller concurrent
-submission-idempotency coverage against PostgreSQL, plus conflicting key reuse.
-
-Run ordinary lease, retry, backoff, and attempt-exhaustion behavior with one
-worker:
-
-```bash
-docker compose up -d --build --scale worker=1
-docker compose exec -e RUN_WORKER_TESTS=1 api pytest -q tests/test_worker.py
-```
-
-This includes the normal repeated `write_effect` case: two executions, two
-audit rows, and one logical effect.
-
-Run the queued-claim and expired-reclaim concurrency coverage with four workers:
+Run ordinary worker behavior plus four-worker claim/reclaim concurrency:
 
 ```bash
 docker compose up -d --build --scale worker=4
 docker compose exec \
-  -e RUN_WORKER_TESTS=1 \
-  -e RUN_MULTI_WORKER_TESTS=1 \
+  -e RUN_WORKER_TESTS=1 -e RUN_MULTI_WORKER_TESTS=1 \
   api pytest -q tests/test_worker.py
 ```
 
-Run the self-terminating post-effect crash test with two workers and a short
-lease:
+Run the self-terminating post-effect crash integration test:
 
 ```bash
 JOB_LEASE_SECONDS=1 RETRY_BASE_SECONDS=0.25 \
   docker compose up -d --build --scale worker=2
 docker compose exec \
-  -e RUN_WORKER_TESTS=1 \
-  -e RUN_EFFECT_CRASH_TESTS=1 \
+  -e RUN_WORKER_TESTS=1 -e RUN_EFFECT_CRASH_TESTS=1 \
   api pytest -q tests/test_worker.py -k post_effect_crash
 ```
 
-Coverage includes submission races and conflicts, duplicate handler execution,
-idempotent effects, lease assignment and clearing, rejection of unexpired
-leases, expired reclaim with a replaced lease, concurrent `SKIP LOCKED`
-behavior, successful terminal-state exclusion, future retry scheduling, 1x/2x
-backoff, attempt exhaustion, and finalization of an abandoned job already at
-the limit.
+Coverage includes API submission races and conflicts, PostgreSQL locked-row
+skipping, unexpired-lease rejection, expired reclaim, stale-completion
+protection, retries and 1×/2× backoff, attempt exhaustion, concurrent claims,
+duplicate execution, idempotent effects, percentile calculation, aggregation,
+and claim-log parsing.
 
-## Delivery guarantee and current limitations
+## Limitations
 
-Relay provides **at-least-once execution behavior**, not exactly-once
-execution. A payload can execute more than once if a worker completes its work
-but dies before recording success: its lease eventually expires and another
-worker executes the payload again. API submission idempotency does not alter
-that delivery guarantee; consumer-side idempotency is what makes repeated
-effects safe.
+- PostgreSQL is the centralized coordinator; there is no queue partitioning.
+- Leases are fixed and not renewed. A legitimate job longer than its lease can
+  be reclaimed and run concurrently on another worker.
+- Execution is at-least-once, never exactly-once; consumers own side-effect
+  idempotency.
+- Workers poll rather than receive push notifications.
+- Retries have exponential backoff but no jitter, specialized error classes,
+  or dead-letter infrastructure.
+- There are no priorities, DAGs, worker registry, heartbeats, admission
+  control, authentication, or production observability stack.
+- The benchmark is a synchronized, local, containerized experiment on one
+  laptop, not a large-cluster or steady-state production load test.
 
-Leases are fixed and are not renewed. There are no heartbeats, renewal threads,
-worker registry, or reaper service. A legitimate job whose runtime exceeds its
-lease can therefore be reclaimed prematurely and execute concurrently on more
-than one worker. Configure the lease comfortably above normal job runtime.
-
-Relay also does not yet include retry jitter, specialized retry classes, dead
-letter infrastructure, priority scheduling, or formal throughput/latency
-benchmarks.
-
-## Schema setup
-
-On startup, the API runs SQLAlchemy's idempotent `metadata.create_all`, which
-creates the new `effects` and `effect_attempts` tables. Because `create_all`
-does not add an index to an existing table, startup also explicitly creates the
-partial unique idempotency-key index with `checkfirst=True`. A versioned
-migration tool can replace this small-project setup if later schema changes
-need it.
+These are deliberate scope decisions. Relay's value is the combination of
+correctness, explicit failure semantics, reproducible measurements, and a
+small enough implementation to understand end to end.
