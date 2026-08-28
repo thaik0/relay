@@ -1,14 +1,13 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db import engine
+from app.db import create_schema, engine
 from app.main import app
-from app.models import metadata
 
 
 @pytest.fixture(scope="session", autouse=True)
 def schema() -> None:
-    metadata.create_all(engine)
+    create_schema()
 
 
 @pytest.fixture(autouse=True)

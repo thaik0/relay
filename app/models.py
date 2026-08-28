@@ -40,3 +40,10 @@ jobs = sa.Table(
         name="ck_jobs_valid_status",
     ),
 )
+
+jobs_idempotency_key_index = sa.Index(
+    "uq_jobs_idempotency_key_not_null",
+    jobs.c.idempotency_key,
+    unique=True,
+    postgresql_where=jobs.c.idempotency_key.is_not(None),
+)

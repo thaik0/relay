@@ -1,6 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
+
+from app.db import engine
+from app.models import jobs
 
 
 def test_submit_job_creates_persisted_queued_job(client: TestClient) -> None:
@@ -38,6 +43,76 @@ def test_payload_json_round_trips(client: TestClient) -> None:
 
     assert retrieved.status_code == 200
     assert retrieved.json()["payload"] == payload
+
+
+def test_matching_idempotent_submission_returns_original_job(
+    client: TestClient,
+) -> None:
+    request = {
+        "payload": {"type": "sleep", "duration_ms": 100},
+        "idempotency_key": "request-repeat",
+    }
+
+    created = client.post("/jobs", json=request)
+    replayed = client.post("/jobs", json=request)
+
+    assert created.status_code == 201
+    assert replayed.status_code == 200
+    assert replayed.json() == created.json()
+    with engine.connect() as connection:
+        count = connection.execute(
+            sa.select(sa.func.count()).select_from(jobs)
+        ).scalar_one()
+    assert count == 1
+
+
+def test_concurrent_matching_submissions_return_one_job(client: TestClient) -> None:
+    request = {
+        "payload": {"type": "sleep", "duration_ms": 100},
+        "idempotency_key": "request-concurrent",
+    }
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        responses = list(
+            executor.map(lambda _: client.post("/jobs", json=request), range(8))
+        )
+
+    assert sorted(response.status_code for response in responses) == [200] * 7 + [201]
+    assert len({response.json()["id"] for response in responses}) == 1
+    with engine.connect() as connection:
+        count = connection.execute(
+            sa.select(sa.func.count()).select_from(jobs)
+        ).scalar_one()
+    assert count == 1
+
+
+def test_idempotency_key_reuse_with_different_payload_conflicts(
+    client: TestClient,
+) -> None:
+    created = client.post(
+        "/jobs",
+        json={
+            "payload": {"type": "sleep", "duration_ms": 100},
+            "idempotency_key": "request-conflict",
+        },
+    )
+    conflict = client.post(
+        "/jobs",
+        json={
+            "payload": {"type": "sleep", "duration_ms": 200},
+            "idempotency_key": "request-conflict",
+        },
+    )
+
+    assert created.status_code == 201
+    assert conflict.status_code == 409
+    assert conflict.json() == {
+        "detail": "Idempotency key is already associated with a different payload"
+    }
+    with engine.connect() as connection:
+        persisted = connection.execute(sa.select(jobs)).mappings().one()
+    assert str(persisted["id"]) == created.json()["id"]
+    assert persisted["payload"] == {"type": "sleep", "duration_ms": 100}
 
 
 def test_get_nonexistent_job_returns_404(client: TestClient) -> None:
