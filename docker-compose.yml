@@ -43,6 +43,9 @@ services:
     init: true
     environment:
       DATABASE_URL: postgresql://relay:relay@db:5432/relay
+      JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-10}
+      MAX_JOB_ATTEMPTS: ${MAX_JOB_ATTEMPTS:-3}
+      RETRY_BASE_SECONDS: ${RETRY_BASE_SECONDS:-1}
     depends_on:
       api:
         condition: service_healthy
