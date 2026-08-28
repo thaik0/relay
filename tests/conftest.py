@@ -13,7 +13,9 @@ def schema() -> None:
 @pytest.fixture(autouse=True)
 def clean_jobs(schema: None) -> None:
     with engine.begin() as connection:
-        connection.exec_driver_sql("TRUNCATE TABLE jobs")
+        connection.exec_driver_sql(
+            "TRUNCATE TABLE effect_attempts, effects, jobs RESTART IDENTITY"
+        )
 
 
 @pytest.fixture

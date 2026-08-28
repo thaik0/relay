@@ -51,6 +51,10 @@ struct Job {
     std::optional<std::string> type_json_kind;
     std::optional<std::string> duration_ms;
     std::optional<std::string> duration_json_kind;
+    std::optional<std::string> operation_id;
+    std::optional<std::string> operation_id_json_kind;
+    std::optional<std::string> value;
+    std::optional<std::string> value_json_kind;
     int attempt;
     std::string lease_expires_at;
     bool reclaimed;
@@ -302,6 +306,10 @@ std::optional<Job> claim_job(PGconn* connection, const WorkerConfig& config) {
                 jsonb_typeof(job.payload->'type'),
                 job.payload->>'duration_ms',
                 jsonb_typeof(job.payload->'duration_ms'),
+                job.payload->>'operation_id',
+                jsonb_typeof(job.payload->'operation_id'),
+                job.payload->>'value',
+                jsonb_typeof(job.payload->'value'),
                 job.attempts::text,
                 job.lease_expires_at::text,
                 candidate.previous_status
@@ -318,9 +326,13 @@ std::optional<Job> claim_job(PGconn* connection, const WorkerConfig& config) {
             .type_json_kind = optional_value(claimed.get(), 0, 2),
             .duration_ms = optional_value(claimed.get(), 0, 3),
             .duration_json_kind = optional_value(claimed.get(), 0, 4),
-            .attempt = std::stoi(PQgetvalue(claimed.get(), 0, 5)),
-            .lease_expires_at = PQgetvalue(claimed.get(), 0, 6),
-            .reclaimed = std::string_view(PQgetvalue(claimed.get(), 0, 7)) == "running",
+            .operation_id = optional_value(claimed.get(), 0, 5),
+            .operation_id_json_kind = optional_value(claimed.get(), 0, 6),
+            .value = optional_value(claimed.get(), 0, 7),
+            .value_json_kind = optional_value(claimed.get(), 0, 8),
+            .attempt = std::stoi(PQgetvalue(claimed.get(), 0, 9)),
+            .lease_expires_at = PQgetvalue(claimed.get(), 0, 10),
+            .reclaimed = std::string_view(PQgetvalue(claimed.get(), 0, 11)) == "running",
         };
     }
     transaction.commit();
@@ -353,14 +365,93 @@ long long parse_duration_ms(const Job& job) {
     return duration;
 }
 
-void execute_job(const Job& job, const std::string& worker) {
-    if (job.type_json_kind != "string" || !job.type) {
-        throw std::runtime_error("job type must be a string");
+const std::string& required_string(
+    const std::optional<std::string>& value,
+    const std::optional<std::string>& json_kind,
+    std::string_view name
+) {
+    if (json_kind != "string" || !value) {
+        throw std::runtime_error(std::string(name) + " must be a string");
     }
-    if (*job.type == "fail") {
+    return *value;
+}
+
+void execute_write_effect(
+    PGconn* connection,
+    const Job& job,
+    const std::string& worker
+) {
+    const std::string& operation_id = required_string(
+        job.operation_id,
+        job.operation_id_json_kind,
+        "operation_id"
+    );
+    const std::string& value = required_string(
+        job.value,
+        job.value_json_kind,
+        "value"
+    );
+
+    Transaction transaction(connection);
+    execute_with_params(
+        connection,
+        R"SQL(
+            INSERT INTO effect_attempts (job_id, attempt, operation_id, value)
+            VALUES ($1::uuid, $2::integer, $3, $4)
+        )SQL",
+        {job.id, std::to_string(job.attempt), operation_id, value},
+        PGRES_COMMAND_OK
+    );
+    Result inserted = execute_with_params(
+        connection,
+        R"SQL(
+            INSERT INTO effects (operation_id, value)
+            VALUES ($1, $2)
+            ON CONFLICT (operation_id) DO NOTHING
+            RETURNING operation_id
+        )SQL",
+        {operation_id, value},
+        PGRES_TUPLES_OK
+    );
+    const bool applied = PQntuples(inserted.get()) == 1;
+    if (!applied) {
+        Result existing = execute_with_params(
+            connection,
+            "SELECT value FROM effects WHERE operation_id = $1",
+            {operation_id},
+            PGRES_TUPLES_OK
+        );
+        if (
+            PQntuples(existing.get()) != 1
+            || std::string_view(PQgetvalue(existing.get(), 0, 0)) != value
+        ) {
+            throw std::runtime_error(
+                "operation_id is already associated with a different value"
+            );
+        }
+    }
+    transaction.commit();
+
+    std::cout << "worker=" << worker
+              << " event=" << (applied ? "effect_applied" : "effect_already_applied")
+              << " job=" << job.id << " attempt=" << job.attempt
+              << " operation_id=" << operation_id << std::endl;
+}
+
+void execute_job(PGconn* connection, const Job& job, const std::string& worker) {
+    const std::string& type = required_string(
+        job.type,
+        job.type_json_kind,
+        "job type"
+    );
+    if (type == "fail") {
         throw std::runtime_error("deterministic failure requested");
     }
-    if (*job.type != "sleep") {
+    if (type == "write_effect") {
+        execute_write_effect(connection, job, worker);
+        return;
+    }
+    if (type != "sleep") {
         throw std::runtime_error("unsupported job type: " + *job.type);
     }
 
@@ -484,7 +575,7 @@ int main() {
                       << " lease_expires_at=\"" << job->lease_expires_at << "\""
                       << std::endl;
             try {
-                execute_job(*job, config.worker);
+                execute_job(connection.get(), *job, config.worker);
             } catch (const std::exception& error) {
                 std::cerr << "worker=" << config.worker << " event=failed job="
                           << job->id << " attempt=" << job->attempt

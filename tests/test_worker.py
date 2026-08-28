@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
 from app.db import engine
-from app.models import JobStatus, jobs
+from app.models import JobStatus, effect_attempts, effects, jobs
 
 
 pytestmark = pytest.mark.skipif(
@@ -108,6 +108,36 @@ def test_worker_executes_sleep_job(client: TestClient) -> None:
     still_completed = client.get(f"/jobs/{created['id']}").json()
     assert still_completed["status"] == "succeeded"
     assert still_completed["attempts"] == 1
+
+
+def test_write_effect_is_idempotent_across_repeated_execution(
+    client: TestClient,
+) -> None:
+    payload = {
+        "type": "write_effect",
+        "operation_id": "operation-repeat",
+        "value": "hello",
+    }
+    created = [submit_job(client, payload), submit_job(client, payload)]
+
+    completed = [
+        wait_for_job(
+            client,
+            job["id"],
+            lambda persisted: persisted["status"] == "succeeded",
+        )
+        for job in created
+    ]
+
+    assert [job["attempts"] for job in completed] == [1, 1]
+    with engine.connect() as connection:
+        persisted_effects = connection.execute(sa.select(effects)).mappings().all()
+        attempts = connection.execute(sa.select(effect_attempts)).mappings().all()
+    assert len(persisted_effects) == 1
+    assert persisted_effects[0]["operation_id"] == "operation-repeat"
+    assert persisted_effects[0]["value"] == "hello"
+    assert len(attempts) == 2
+    assert {attempt["operation_id"] for attempt in attempts} == {"operation-repeat"}
 
 
 def test_worker_does_not_reclaim_an_unexpired_lease(client: TestClient) -> None:
