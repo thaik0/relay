@@ -1,9 +1,9 @@
 # Relay
 
-Relay is a small distributed job queue built in milestones. Milestone 4 adds
-fixed-duration leases, worker crash recovery, bounded retries, and exponential
-backoff to the FastAPI control plane, PostgreSQL queue, and concurrent C++20
-workers.
+Relay is a small distributed job queue built in milestones. Milestone 5 adds
+submission idempotency and a concrete demonstration of duplicate execution and
+idempotent side effects to the FastAPI control plane, PostgreSQL queue, and
+concurrent C++20 workers.
 
 ## Architecture
 
@@ -31,12 +31,37 @@ The worker supports these payloads:
 ```json
 {"type": "sleep", "duration_ms": 500}
 {"type": "fail"}
+{"type": "write_effect", "operation_id": "operation-123", "value": "hello"}
 ```
 
 `duration_ms` must be an integer from 0 through 60000. The `fail` job always
 fails and exists to demonstrate deterministic retries. Missing or invalid
 fields and unsupported job types are also execution failures: they retry until
 the configured attempt limit and do not stop the worker.
+
+`write_effect` is the small Milestone 5 side-effect example. Every execution is
+recorded in `effect_attempts`, while the logical result is stored in `effects`.
+It is intentionally specific rather than a generic output or workflow system.
+
+## Submission idempotency
+
+`POST /jobs` accepts an optional `idempotency_key`:
+
+```bash
+curl -i -X POST http://localhost:8000/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"payload":{"type":"sleep","duration_ms":100},"idempotency_key":"request-abc"}'
+```
+
+The first request creates a job and returns `201 Created`. Repeating the same
+key and JSON payload returns the original job and `200 OK`. Reusing the key
+with a different payload returns `409 Conflict`.
+
+PostgreSQL enforces a partial unique index on non-null idempotency keys. The API
+uses `INSERT ... ON CONFLICT DO NOTHING`, then reads the winning row in the
+same transaction. Concurrent callers therefore converge on one job ID without
+an application mutex or a race-prone `SELECT`-then-`INSERT`. Requests without
+an idempotency key retain the original behavior and always create a new job.
 
 ## Run multiple workers
 
@@ -187,6 +212,62 @@ The demo prints the relevant worker logs and exits nonzero if recovery does not
 occur. It exercises actual worker death, not graceful shutdown or an ordinary
 job exception.
 
+## Duplicate execution and an idempotent effect
+
+Submission idempotency and execution idempotency solve different problems. An
+idempotency key prevents clients from creating the same logical job twice. It
+cannot prevent an already-created job from executing twice after a worker loses
+its lease or dies before acknowledging success.
+
+Run the deterministic post-effect crash demo:
+
+```bash
+python3 scripts/idempotent_effect_demo.py
+```
+
+The script starts two workers with a short lease and submits:
+
+```json
+{
+  "payload": {
+    "type": "write_effect",
+    "operation_id": "operation-123",
+    "value": "hello",
+    "crash_after_effect_on_attempt": 1
+  }
+}
+```
+
+The first worker commits the effect and its execution audit, logs
+`effect_applied`, and intentionally terminates the process before updating the
+job. The row remains `running` until its lease expires. A second worker then
+reclaims attempt 2, executes the handler again, logs
+`effect_already_applied`, and marks the job succeeded.
+
+The non-idempotent `effect_attempts` audit contains two rows, making duplicate
+execution observable. The real `effects` table uses `operation_id` as its
+primary key, and the handler uses `ON CONFLICT (operation_id) DO NOTHING`, so
+only one logical effect exists. Reusing an operation ID with a different value
+is treated as an execution error rather than silently accepted.
+
+This PostgreSQL example is deliberately reproducible, not a distributed
+transaction pattern. Real consumers need an idempotency mechanism owned by the
+side-effecting system, such as a payment API idempotency key, an email message
+ID, a unique database operation ID, or a deterministic object/resource ID.
+
+### Three separate guarantees
+
+- **Atomic claim:** `FOR UPDATE SKIP LOCKED` prevents two workers from owning
+  the same execution attempt simultaneously.
+- **At-least-once recovery:** an expired lease allows the job to execute again
+  when ownership is lost.
+- **Idempotent side effect:** a unique operation ID allows repeated executions
+  without creating repeated logical effects.
+
+Relay does not guarantee exactly-once execution. It provides at-least-once
+execution, and consumers that require duplicate-safe behavior must make their
+side effects idempotent.
+
 ## Batch demonstration
 
 With four workers running, submit 100 short jobs:
@@ -210,6 +291,9 @@ docker compose stop worker
 docker compose exec api pytest -q tests/test_jobs.py tests/test_claiming.py
 ```
 
+`tests/test_jobs.py` includes sequential and eight-caller concurrent
+submission-idempotency coverage against PostgreSQL, plus conflicting key reuse.
+
 Run ordinary lease, retry, backoff, and attempt-exhaustion behavior with one
 worker:
 
@@ -217,6 +301,9 @@ worker:
 docker compose up -d --build --scale worker=1
 docker compose exec -e RUN_WORKER_TESTS=1 api pytest -q tests/test_worker.py
 ```
+
+This includes the normal repeated `write_effect` case: two executions, two
+audit rows, and one logical effect.
 
 Run the queued-claim and expired-reclaim concurrency coverage with four workers:
 
@@ -228,18 +315,33 @@ docker compose exec \
   api pytest -q tests/test_worker.py
 ```
 
-Coverage includes lease assignment and clearing, rejection of unexpired leases,
-expired reclaim with a replaced lease, concurrent `SKIP LOCKED` behavior,
-successful terminal-state exclusion, future retry scheduling, 1x/2x backoff,
-attempt exhaustion, and finalization of an abandoned job already at the limit.
+Run the self-terminating post-effect crash test with two workers and a short
+lease:
+
+```bash
+JOB_LEASE_SECONDS=1 RETRY_BASE_SECONDS=0.25 \
+  docker compose up -d --build --scale worker=2
+docker compose exec \
+  -e RUN_WORKER_TESTS=1 \
+  -e RUN_EFFECT_CRASH_TESTS=1 \
+  api pytest -q tests/test_worker.py -k post_effect_crash
+```
+
+Coverage includes submission races and conflicts, duplicate handler execution,
+idempotent effects, lease assignment and clearing, rejection of unexpired
+leases, expired reclaim with a replaced lease, concurrent `SKIP LOCKED`
+behavior, successful terminal-state exclusion, future retry scheduling, 1x/2x
+backoff, attempt exhaustion, and finalization of an abandoned job already at
+the limit.
 
 ## Delivery guarantee and current limitations
 
-Relay now provides **at-least-once execution behavior**, not exactly-once
+Relay provides **at-least-once execution behavior**, not exactly-once
 execution. A payload can execute more than once if a worker completes its work
 but dies before recording success: its lease eventually expires and another
-worker executes the payload again. Duplicate side-effect protection and use of
-the existing `idempotency_key` field are deliberately deferred to Milestone 5.
+worker executes the payload again. API submission idempotency does not alter
+that delivery guarantee; consumer-side idempotency is what makes repeated
+effects safe.
 
 Leases are fixed and are not renewed. There are no heartbeats, renewal threads,
 worker registry, or reaper service. A legitimate job whose runtime exceeds its
@@ -252,7 +354,9 @@ benchmarks.
 
 ## Schema setup
 
-On startup, the API runs SQLAlchemy's idempotent `metadata.create_all`. The
-Milestone 1 schema already contained `attempts`, `available_at`, and
-`lease_expires_at`, so Milestone 4 does not require a table migration. A
-versioned migration tool can replace this setup if later schema changes need it.
+On startup, the API runs SQLAlchemy's idempotent `metadata.create_all`, which
+creates the new `effects` and `effect_attempts` tables. Because `create_all`
+does not add an index to an existing table, startup also explicitly creates the
+partial unique idempotency-key index with `checkfirst=True`. A versioned
+migration tool can replace this small-project setup if later schema changes
+need it.
