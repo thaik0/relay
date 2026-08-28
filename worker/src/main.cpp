@@ -55,6 +55,20 @@ std::string postgres_error(PGconn* connection) {
     return message;
 }
 
+std::string worker_id() {
+    const char* configured = std::getenv("WORKER_ID");
+    if (configured != nullptr && *configured != '\0') {
+        return configured;
+    }
+
+    const char* hostname = std::getenv("HOSTNAME");
+    if (hostname != nullptr && *hostname != '\0') {
+        return std::string("worker-") + hostname;
+    }
+
+    return "worker-unknown";
+}
+
 Result execute(PGconn* connection, const char* sql, ExecStatusType expected) {
     Result result(PQexec(connection, sql));
     if (!result || PQresultStatus(result.get()) != expected) {
@@ -136,7 +150,9 @@ std::optional<Job> claim_job(PGconn* connection) {
               AND available_at <= CURRENT_TIMESTAMP
             ORDER BY available_at, created_at, id
             LIMIT 1
-            FOR UPDATE
+            -- Keep selection and the queued -> running transition in this
+            -- transaction. Other workers skip this row instead of waiting.
+            FOR UPDATE SKIP LOCKED
         )SQL",
         PGRES_TUPLES_OK
     );
@@ -190,7 +206,7 @@ long long parse_duration_ms(const Job& job) {
     return duration;
 }
 
-void execute_job(const Job& job) {
+void execute_job(const Job& job, const std::string& worker) {
     if (job.type_json_kind != "string" || !job.type) {
         throw std::runtime_error("job type must be a string");
     }
@@ -199,8 +215,8 @@ void execute_job(const Job& job) {
     }
 
     const long long duration_ms = parse_duration_ms(job);
-    std::cout << "executing sleep job " << job.id << " for " << duration_ms << " ms"
-              << std::endl;
+    std::cout << "worker=" << worker << " event=executing job=" << job.id
+              << " duration_ms=" << duration_ms << std::endl;
     std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
 }
 
@@ -239,14 +255,15 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    std::cout << "worker started" << std::endl;
+    const std::string worker = worker_id();
+    std::cout << "worker=" << worker << " event=started" << std::endl;
     Connection connection;
 
     while (!stop_requested) {
         try {
             if (!connection || PQstatus(connection.get()) != CONNECTION_OK) {
                 connection = connect_to_postgres(database_url);
-                std::cout << "connected to PostgreSQL" << std::endl;
+                std::cout << "worker=" << worker << " event=connected" << std::endl;
             }
 
             std::optional<Job> job = claim_job(connection.get());
@@ -255,19 +272,23 @@ int main() {
                 continue;
             }
 
-            std::cout << "claimed job " << job->id << std::endl;
+            std::cout << "worker=" << worker << " event=claimed job=" << job->id
+                      << std::endl;
             try {
-                execute_job(*job);
+                execute_job(*job, worker);
             } catch (const std::exception& error) {
-                std::cerr << "job " << job->id << " failed: " << error.what() << std::endl;
+                std::cerr << "worker=" << worker << " event=failed job=" << job->id
+                          << " error=\"" << error.what() << "\"" << std::endl;
                 mark_terminal(connection.get(), *job, "failed");
                 continue;
             }
 
             mark_terminal(connection.get(), *job, "succeeded");
-            std::cout << "job " << job->id << " succeeded" << std::endl;
+            std::cout << "worker=" << worker << " event=succeeded job=" << job->id
+                      << std::endl;
         } catch (const std::exception& error) {
-            std::cerr << "worker database error: " << error.what() << std::endl;
+            std::cerr << "worker=" << worker << " event=database_error error=\""
+                      << error.what() << "\"" << std::endl;
             connection.reset();
             if (!stop_requested) {
                 sleep_before_retry(reconnect_interval);
@@ -275,6 +296,6 @@ int main() {
         }
     }
 
-    std::cout << "worker stopped" << std::endl;
+    std::cout << "worker=" << worker << " event=stopped" << std::endl;
     return EXIT_SUCCESS;
 }
