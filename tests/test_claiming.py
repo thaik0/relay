@@ -55,4 +55,3 @@ def test_claim_query_skips_a_row_locked_by_another_connection() -> None:
                 skipped_to_id = second_connection.execute(CLAIMABLE_JOB).scalar_one()
 
             assert skipped_to_id == second_id
-
