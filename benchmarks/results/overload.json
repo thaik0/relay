@@ -1,0 +1,10 @@
+{
+  "recorded_at": "2026-08-28T13:31:58.234010+00:00",
+  "worker_count": 1,
+  "job_count": 300,
+  "job_duration_ms": 25,
+  "arrival_rate_jobs_per_second": 60.0,
+  "sample_interval_ms": 250,
+  "release_time": "2026-08-28 13:31:48.637054+00",
+  "queue_depth_definition": "arrived jobs whose status is queued"
+}

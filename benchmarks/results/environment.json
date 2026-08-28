@@ -1,0 +1,22 @@
+{
+  "recorded_at": "2026-08-28T13:29:48.711949+00:00",
+  "os": "macOS-26.6.2-arm64-arm-64bit",
+  "architecture": "arm64",
+  "logical_cpu_count": 12,
+  "docker_version": "29.6.1",
+  "docker_compose_version": "5.1.4",
+  "git_commit": "63439322a693c5a83b2ad60513dede5704f1f7bc",
+  "worker_counts": [
+    1,
+    4,
+    8
+  ],
+  "trials_per_worker_count": 3,
+  "job_count_per_trial": 600,
+  "job_duration_ms": 25,
+  "warmup_jobs_per_worker_count": 30,
+  "lease_seconds": 10,
+  "max_attempts": 3,
+  "retry_base_seconds": 1,
+  "worker_poll_interval_ms": 250
+}

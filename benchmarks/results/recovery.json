@@ -1,0 +1,11 @@
+{
+  "job_id": "da941370-dba7-4b2f-952f-18d499720b03",
+  "lease_seconds": 5.0,
+  "job_duration_ms": 2500,
+  "failure_time": "2026-08-28T13:32:16.679957+00:00",
+  "reclaim_observed_time": "2026-08-28T13:32:21.656992+00:00",
+  "recovery_time_seconds": 4.976868,
+  "initial_lease_expires_at": "2026-08-28T13:32:21.430101Z",
+  "observation_poll_interval_ms": 50,
+  "definition": "time from completed docker kill to API observation of attempt 2"
+}
