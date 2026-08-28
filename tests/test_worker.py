@@ -1,10 +1,16 @@
 import os
 import time
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
+
+from app.db import engine
+from app.models import JobStatus, jobs
 
 
 pytestmark = pytest.mark.skipif(
@@ -37,6 +43,14 @@ def submit_job(client: TestClient, payload: dict[str, Any]) -> dict[str, Any]:
     response = client.post("/jobs", json={"payload": payload})
     assert response.status_code == 201
     return response.json()
+
+
+def persisted_batch(job_ids: list[UUID]) -> list[dict[str, Any]]:
+    statement = sa.select(jobs.c.id, jobs.c.status, jobs.c.attempts).where(
+        jobs.c.id.in_(job_ids)
+    )
+    with engine.connect() as connection:
+        return [dict(row) for row in connection.execute(statement).mappings()]
 
 
 def test_worker_executes_sleep_job(client: TestClient) -> None:
@@ -73,3 +87,50 @@ def test_invalid_jobs_fail_and_worker_continues(client: TestClient) -> None:
         lambda job: job["status"] == "succeeded",
     )
     assert succeeded["completed_at"] is not None
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_MULTI_WORKER_TESTS") != "1",
+    reason="requires at least two scaled Compose worker processes",
+)
+def test_multiple_workers_complete_a_batch_without_duplicate_claims() -> None:
+    count = 24
+    job_ids = [uuid4() for _ in range(count)]
+    now = datetime.now(timezone.utc)
+    available_at = now + timedelta(seconds=1)
+    batch = [
+        {
+            "id": job_id,
+            "payload": {"type": "sleep", "duration_ms": 200},
+            "status": JobStatus.QUEUED.value,
+            "attempts": 0,
+            "available_at": available_at,
+            "created_at": now,
+        }
+        for job_id in job_ids
+    ]
+    with engine.begin() as connection:
+        connection.execute(sa.insert(jobs), batch)
+
+    deadline = time.monotonic() + 15
+    largest_running_count = 0
+    last_batch: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        last_batch = persisted_batch(job_ids)
+        statuses = [job["status"] for job in last_batch]
+        largest_running_count = max(
+            largest_running_count,
+            statuses.count(JobStatus.RUNNING.value),
+        )
+        assert JobStatus.FAILED.value not in statuses
+        if len(statuses) == count and all(
+            status == JobStatus.SUCCEEDED.value for status in statuses
+        ):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(f"batch did not complete; last values: {last_batch}")
+
+    assert largest_running_count >= 2
+    assert len(last_batch) == count
+    assert all(job["attempts"] == 1 for job in last_batch)
