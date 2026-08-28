@@ -328,3 +328,46 @@ def test_multiple_workers_reclaim_one_expired_job_once(client: TestClient) -> No
     )
     assert completed["attempts"] == 2
     assert completed["lease_expires_at"] is None
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_EFFECT_CRASH_TESTS") != "1",
+    reason="requires two workers because the first process intentionally exits",
+)
+def test_post_effect_crash_reexecutes_but_does_not_duplicate_effect(
+    client: TestClient,
+) -> None:
+    created = submit_job(
+        client,
+        {
+            "type": "write_effect",
+            "operation_id": "operation-crash-recovery",
+            "value": "hello",
+            "crash_after_effect_on_attempt": 1,
+        },
+    )
+
+    completed = wait_for_job(
+        client,
+        created["id"],
+        lambda job: job["status"] == "succeeded",
+        timeout_seconds=8,
+    )
+
+    assert completed["attempts"] == 2
+    assert completed["lease_expires_at"] is None
+    with engine.connect() as connection:
+        persisted_effects = connection.execute(
+            sa.select(effects).where(
+                effects.c.operation_id == "operation-crash-recovery"
+            )
+        ).mappings().all()
+        executions = connection.execute(
+            sa.select(effect_attempts)
+            .where(effect_attempts.c.job_id == UUID(created["id"]))
+            .order_by(effect_attempts.c.attempt)
+        ).mappings().all()
+
+    assert len(persisted_effects) == 1
+    assert persisted_effects[0]["value"] == "hello"
+    assert [execution["attempt"] for execution in executions] == [1, 2]

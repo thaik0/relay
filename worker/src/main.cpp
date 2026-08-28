@@ -55,6 +55,8 @@ struct Job {
     std::optional<std::string> operation_id_json_kind;
     std::optional<std::string> value;
     std::optional<std::string> value_json_kind;
+    std::optional<std::string> crash_after_effect_on_attempt;
+    std::optional<std::string> crash_after_effect_on_attempt_json_kind;
     int attempt;
     std::string lease_expires_at;
     bool reclaimed;
@@ -310,6 +312,8 @@ std::optional<Job> claim_job(PGconn* connection, const WorkerConfig& config) {
                 jsonb_typeof(job.payload->'operation_id'),
                 job.payload->>'value',
                 jsonb_typeof(job.payload->'value'),
+                job.payload->>'crash_after_effect_on_attempt',
+                jsonb_typeof(job.payload->'crash_after_effect_on_attempt'),
                 job.attempts::text,
                 job.lease_expires_at::text,
                 candidate.previous_status
@@ -330,9 +334,15 @@ std::optional<Job> claim_job(PGconn* connection, const WorkerConfig& config) {
             .operation_id_json_kind = optional_value(claimed.get(), 0, 6),
             .value = optional_value(claimed.get(), 0, 7),
             .value_json_kind = optional_value(claimed.get(), 0, 8),
-            .attempt = std::stoi(PQgetvalue(claimed.get(), 0, 9)),
-            .lease_expires_at = PQgetvalue(claimed.get(), 0, 10),
-            .reclaimed = std::string_view(PQgetvalue(claimed.get(), 0, 11)) == "running",
+            .crash_after_effect_on_attempt = optional_value(claimed.get(), 0, 9),
+            .crash_after_effect_on_attempt_json_kind = optional_value(
+                claimed.get(),
+                0,
+                10
+            ),
+            .attempt = std::stoi(PQgetvalue(claimed.get(), 0, 11)),
+            .lease_expires_at = PQgetvalue(claimed.get(), 0, 12),
+            .reclaimed = std::string_view(PQgetvalue(claimed.get(), 0, 13)) == "running",
         };
     }
     transaction.commit();
@@ -376,7 +386,32 @@ const std::string& required_string(
     return *value;
 }
 
-void execute_write_effect(
+std::optional<int> crash_after_effect_attempt(const Job& job) {
+    if (!job.crash_after_effect_on_attempt) {
+        return std::nullopt;
+    }
+    if (job.crash_after_effect_on_attempt_json_kind != "number") {
+        throw std::runtime_error(
+            "crash_after_effect_on_attempt must be a positive integer number"
+        );
+    }
+
+    long long attempt = 0;
+    const char* begin = job.crash_after_effect_on_attempt->data();
+    const char* end = begin + job.crash_after_effect_on_attempt->size();
+    const auto [position, error] = std::from_chars(begin, end, attempt);
+    if (
+        error != std::errc{} || position != end || attempt <= 0
+        || attempt > std::numeric_limits<int>::max()
+    ) {
+        throw std::runtime_error(
+            "crash_after_effect_on_attempt must be a positive integer number"
+        );
+    }
+    return static_cast<int>(attempt);
+}
+
+bool execute_write_effect(
     PGconn* connection,
     const Job& job,
     const std::string& worker
@@ -391,6 +426,7 @@ void execute_write_effect(
         job.value_json_kind,
         "value"
     );
+    const std::optional<int> crash_attempt = crash_after_effect_attempt(job);
 
     Transaction transaction(connection);
     execute_with_params(
@@ -436,9 +472,10 @@ void execute_write_effect(
               << " event=" << (applied ? "effect_applied" : "effect_already_applied")
               << " job=" << job.id << " attempt=" << job.attempt
               << " operation_id=" << operation_id << std::endl;
+    return crash_attempt == job.attempt;
 }
 
-void execute_job(PGconn* connection, const Job& job, const std::string& worker) {
+bool execute_job(PGconn* connection, const Job& job, const std::string& worker) {
     const std::string& type = required_string(
         job.type,
         job.type_json_kind,
@@ -448,8 +485,7 @@ void execute_job(PGconn* connection, const Job& job, const std::string& worker) 
         throw std::runtime_error("deterministic failure requested");
     }
     if (type == "write_effect") {
-        execute_write_effect(connection, job, worker);
-        return;
+        return execute_write_effect(connection, job, worker);
     }
     if (type != "sleep") {
         throw std::runtime_error("unsupported job type: " + *job.type);
@@ -459,6 +495,7 @@ void execute_job(PGconn* connection, const Job& job, const std::string& worker) 
     std::cout << "worker=" << worker << " event=executing job=" << job.id
               << " duration_ms=" << duration_ms << std::endl;
     std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
+    return false;
 }
 
 bool record_success(PGconn* connection, const Job& job) {
@@ -575,7 +612,18 @@ int main() {
                       << " lease_expires_at=\"" << job->lease_expires_at << "\""
                       << std::endl;
             try {
-                execute_job(connection.get(), *job, config.worker);
+                const bool intentional_crash = execute_job(
+                    connection.get(),
+                    *job,
+                    config.worker
+                );
+                if (intentional_crash) {
+                    std::cout << "worker=" << config.worker
+                              << " event=intentional_post_effect_crash job="
+                              << job->id << " attempt=" << job->attempt
+                              << std::endl;
+                    std::_Exit(86);
+                }
             } catch (const std::exception& error) {
                 std::cerr << "worker=" << config.worker << " event=failed job="
                           << job->id << " attempt=" << job->attempt
