@@ -53,9 +53,46 @@ def persisted_batch(job_ids: list[UUID]) -> list[dict[str, Any]]:
         return [dict(row) for row in connection.execute(statement).mappings()]
 
 
+def insert_running_job(
+    payload: dict[str, Any],
+    *,
+    attempts: int = 1,
+    lease_delta: timedelta,
+) -> str:
+    job_id = uuid4()
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(jobs),
+            {
+                "id": job_id,
+                "payload": payload,
+                "status": JobStatus.RUNNING.value,
+                "attempts": attempts,
+                "available_at": now - timedelta(seconds=1),
+                "lease_expires_at": now + lease_delta,
+                "created_at": now - timedelta(seconds=1),
+            },
+        )
+    return str(job_id)
+
+
+def database_now() -> datetime:
+    with engine.connect() as connection:
+        return connection.execute(sa.select(sa.func.current_timestamp())).scalar_one()
+
+
 def test_worker_executes_sleep_job(client: TestClient) -> None:
-    created = submit_job(client, {"type": "sleep", "duration_ms": 20})
+    created = submit_job(client, {"type": "sleep", "duration_ms": 500})
     assert created["status"] == "queued"
+
+    running = wait_for_job(
+        client,
+        created["id"],
+        lambda job: job["status"] == "running",
+    )
+    assert running["attempts"] == 1
+    assert running["lease_expires_at"] is not None
 
     completed = wait_for_job(
         client,
@@ -65,6 +102,48 @@ def test_worker_executes_sleep_job(client: TestClient) -> None:
 
     assert completed["attempts"] == 1
     assert completed["completed_at"] is not None
+    assert completed["lease_expires_at"] is None
+
+    time.sleep(0.3)
+    still_completed = client.get(f"/jobs/{created['id']}").json()
+    assert still_completed["status"] == "succeeded"
+    assert still_completed["attempts"] == 1
+
+
+def test_worker_does_not_reclaim_an_unexpired_lease(client: TestClient) -> None:
+    job_id = insert_running_job(
+        {"type": "sleep", "duration_ms": 0},
+        lease_delta=timedelta(seconds=2),
+    )
+
+    time.sleep(0.5)
+    persisted = client.get(f"/jobs/{job_id}").json()
+    assert persisted["status"] == "running"
+    assert persisted["attempts"] == 1
+
+
+def test_worker_reclaims_an_expired_lease(client: TestClient) -> None:
+    old_expiration = datetime.now(timezone.utc) - timedelta(seconds=1)
+    job_id = insert_running_job(
+        {"type": "sleep", "duration_ms": 500},
+        lease_delta=timedelta(seconds=-1),
+    )
+
+    reclaimed = wait_for_job(
+        client,
+        job_id,
+        lambda job: job["status"] == "running" and job["attempts"] == 2,
+    )
+    assert reclaimed["lease_expires_at"] is not None
+    assert datetime.fromisoformat(reclaimed["lease_expires_at"]) > old_expiration
+
+    completed = wait_for_job(
+        client,
+        job_id,
+        lambda job: job["status"] == "succeeded",
+    )
+    assert completed["attempts"] == 2
+    assert completed["lease_expires_at"] is None
 
 
 def test_invalid_jobs_fail_and_worker_continues(client: TestClient) -> None:
@@ -76,9 +155,11 @@ def test_invalid_jobs_fail_and_worker_continues(client: TestClient) -> None:
             client,
             created["id"],
             lambda job: job["status"] == "failed",
+            timeout_seconds=8,
         )
-        assert failed["attempts"] == 1
+        assert failed["attempts"] == 3
         assert failed["completed_at"] is not None
+        assert failed["lease_expires_at"] is None
 
     following_job = submit_job(client, {"type": "sleep", "duration_ms": 0})
     succeeded = wait_for_job(
@@ -87,6 +168,70 @@ def test_invalid_jobs_fail_and_worker_continues(client: TestClient) -> None:
         lambda job: job["status"] == "succeeded",
     )
     assert succeeded["completed_at"] is not None
+
+
+def test_failing_job_uses_exponential_backoff_and_exhausts_attempts(
+    client: TestClient,
+) -> None:
+    created = submit_job(client, {"type": "fail"})
+
+    first_retry = wait_for_job(
+        client,
+        created["id"],
+        lambda job: job["status"] == "queued" and job["attempts"] == 1,
+    )
+    first_delay_remaining = (
+        datetime.fromisoformat(first_retry["available_at"]) - database_now()
+    ).total_seconds()
+    assert 0.4 < first_delay_remaining <= 1.05
+    assert first_retry["lease_expires_at"] is None
+    assert first_retry["completed_at"] is None
+
+    second_retry = wait_for_job(
+        client,
+        created["id"],
+        lambda job: job["status"] == "queued" and job["attempts"] == 2,
+        timeout_seconds=3,
+    )
+    second_delay_remaining = (
+        datetime.fromisoformat(second_retry["available_at"]) - database_now()
+    ).total_seconds()
+    assert 1.4 < second_delay_remaining <= 2.05
+    assert second_retry["lease_expires_at"] is None
+
+    failed = wait_for_job(
+        client,
+        created["id"],
+        lambda job: job["status"] == "failed",
+        timeout_seconds=4,
+    )
+    assert failed["attempts"] == 3
+    assert failed["completed_at"] is not None
+    assert failed["lease_expires_at"] is None
+
+    time.sleep(0.4)
+    still_failed = client.get(f"/jobs/{created['id']}").json()
+    assert still_failed["status"] == "failed"
+    assert still_failed["attempts"] == 3
+
+
+def test_expired_job_at_attempt_limit_is_finalized_without_execution(
+    client: TestClient,
+) -> None:
+    job_id = insert_running_job(
+        {"type": "sleep", "duration_ms": 0},
+        attempts=3,
+        lease_delta=timedelta(seconds=-1),
+    )
+
+    failed = wait_for_job(
+        client,
+        job_id,
+        lambda job: job["status"] == "failed",
+    )
+    assert failed["attempts"] == 3
+    assert failed["completed_at"] is not None
+    assert failed["lease_expires_at"] is None
 
 
 @pytest.mark.skipif(
@@ -134,3 +279,22 @@ def test_multiple_workers_complete_a_batch_without_duplicate_claims() -> None:
     assert largest_running_count >= 2
     assert len(last_batch) == count
     assert all(job["attempts"] == 1 for job in last_batch)
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_MULTI_WORKER_TESTS") != "1",
+    reason="requires at least two scaled Compose worker processes",
+)
+def test_multiple_workers_reclaim_one_expired_job_once(client: TestClient) -> None:
+    job_id = insert_running_job(
+        {"type": "sleep", "duration_ms": 500},
+        lease_delta=timedelta(seconds=-1),
+    )
+
+    completed = wait_for_job(
+        client,
+        job_id,
+        lambda job: job["status"] == "succeeded",
+    )
+    assert completed["attempts"] == 2
+    assert completed["lease_expires_at"] is None
