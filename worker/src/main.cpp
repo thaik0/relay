@@ -5,6 +5,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -60,6 +61,7 @@ struct Job {
     int attempt;
     std::string lease_expires_at;
     bool reclaimed;
+    double claim_transaction_latency_ms;
 };
 
 struct WorkerConfig {
@@ -241,6 +243,7 @@ WorkerConfig load_config() {
 }
 
 std::optional<Job> claim_job(PGconn* connection, const WorkerConfig& config) {
+    const auto claim_started_at = std::chrono::steady_clock::now();
     Transaction transaction(connection);
 
     Result exhausted = execute_with_params(
@@ -343,9 +346,17 @@ std::optional<Job> claim_job(PGconn* connection, const WorkerConfig& config) {
             .attempt = std::stoi(PQgetvalue(claimed.get(), 0, 11)),
             .lease_expires_at = PQgetvalue(claimed.get(), 0, 12),
             .reclaimed = std::string_view(PQgetvalue(claimed.get(), 0, 13)) == "running",
+            .claim_transaction_latency_ms = 0,
         };
     }
     transaction.commit();
+
+    if (job) {
+        job->claim_transaction_latency_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - claim_started_at
+            ).count();
+    }
 
     if (PQntuples(exhausted.get()) == 1) {
         std::cout << "worker=" << config.worker
@@ -609,6 +620,9 @@ int main() {
             std::cout << "worker=" << config.worker
                       << " event=" << (job->reclaimed ? "reclaimed" : "claimed")
                       << " job=" << job->id << " attempt=" << job->attempt
+                      << " claim_transaction_latency_ms=" << std::fixed
+                      << std::setprecision(3)
+                      << job->claim_transaction_latency_ms << std::defaultfloat
                       << " lease_expires_at=\"" << job->lease_expires_at << "\""
                       << std::endl;
             try {
