@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -10,14 +11,23 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 API_URL = os.getenv("RELAY_API_URL", "http://localhost:8000")
 LEASE_SECONDS = "5"
 JOB_DURATION_MS = 2500
+DEFAULT_RESULTS_FILE = PROJECT_ROOT / "benchmarks" / "results" / "recovery.json"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--results-file", type=Path, default=DEFAULT_RESULTS_FILE)
+    return parser.parse_args()
 
 
 def compose(*arguments: str, capture_output: bool = False) -> str:
@@ -100,18 +110,22 @@ def claiming_container(job_id: str, timeout_seconds: float = 3) -> str:
 
 def main() -> int:
     sys.stdout.reconfigure(line_buffering=True)
+    args = parse_args()
     try:
         print("starting PostgreSQL, API, and two workers with a 5-second lease")
         compose("up", "-d", "--build", "--scale", "worker=2")
 
         created = request_json(
             "/jobs",
-            {"payload": {"type": "sleep", "duration_ms": JOB_DURATION_MS}},
+            {
+                "payload": {"type": "sleep", "duration_ms": JOB_DURATION_MS},
+                "idempotency_key": f"relay-recovery:{uuid4()}",
+            },
         )
         job_id = created["id"]
         print(f"submitted job={job_id} duration_ms={JOB_DURATION_MS}")
 
-        wait_for_state(
+        initial_claim = wait_for_state(
             job_id,
             lambda job: job["status"] == "running" and job["attempts"] == 1,
             "initial claim",
@@ -120,6 +134,8 @@ def main() -> int:
         victim = claiming_container(job_id)
         print(f"force_killing_container={victim}")
         subprocess.run(["docker", "kill", "--signal", "KILL", victim], check=True)
+        failure_observed_at = datetime.now(timezone.utc)
+        failure_monotonic = time.monotonic()
 
         time.sleep(0.5)
         stranded = request_json(f"/jobs/{job_id}")
@@ -133,6 +149,8 @@ def main() -> int:
             "reclaim after lease expiry",
             8,
         )
+        reclaim_observed_at = datetime.now(timezone.utc)
+        recovery_seconds = time.monotonic() - failure_monotonic
         succeeded = wait_for_state(
             job_id,
             lambda job: job["status"] == "succeeded",
@@ -141,6 +159,27 @@ def main() -> int:
         )
         if succeeded["attempts"] != 2 or succeeded["lease_expires_at"] is not None:
             raise RuntimeError(f"unexpected recovered state: {succeeded}")
+
+        result = {
+            "job_id": job_id,
+            "lease_seconds": float(LEASE_SECONDS),
+            "job_duration_ms": JOB_DURATION_MS,
+            "failure_time": failure_observed_at.isoformat(),
+            "reclaim_observed_time": reclaim_observed_at.isoformat(),
+            "recovery_time_seconds": round(recovery_seconds, 6),
+            "initial_lease_expires_at": initial_claim["lease_expires_at"],
+            "observation_poll_interval_ms": 50,
+            "definition": "time from completed docker kill to API observation of attempt 2",
+        }
+        args.results_file.parent.mkdir(parents=True, exist_ok=True)
+        args.results_file.write_text(
+            json.dumps(result, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"measured_recovery_seconds={recovery_seconds:.3f} "
+            f"results_file={args.results_file}"
+        )
 
         print("\nRelevant worker logs:")
         compose("logs", "--no-color", "worker")
