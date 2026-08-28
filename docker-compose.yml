@@ -38,6 +38,9 @@ services:
     build:
       context: .
       dockerfile: worker/Dockerfile
+    # This service has no fixed container name or host port, so Compose can
+    # create independent worker processes with: --scale worker=<count>.
+    init: true
     environment:
       DATABASE_URL: postgresql://relay:relay@db:5432/relay
     depends_on:
